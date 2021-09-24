@@ -60,7 +60,9 @@ void ZSTD_copyDDictParameters(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
     DEBUGLOG(4, "ZSTD_copyDDictParameters");
     assert(dctx != NULL);
     assert(ddict != NULL);
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     dctx->dictID = ddict->dictID;
+#endif
     dctx->prefixStart = ddict->dictContent;
     dctx->virtualStart = ddict->dictContent;
     dctx->dictEnd = (const BYTE*)ddict->dictContent + ddict->dictSize;
@@ -90,7 +92,9 @@ static size_t
 ZSTD_loadEntropy_intoDDict(ZSTD_DDict* ddict,
                            ZSTD_dictContentType_e dictContentType)
 {
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     ddict->dictID = 0;
+#endif
     ddict->entropyPresent = 0;
     if (dictContentType == ZSTD_dct_rawContent) return 0;
 
@@ -106,8 +110,9 @@ ZSTD_loadEntropy_intoDDict(ZSTD_DDict* ddict,
             return 0;   /* pure content mode */
         }
     }
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     ddict->dictID = MEM_readLE32((const char*)ddict->dictContent + ZSTD_FRAMEIDSIZE);
-
+#endif
     /* load entropy tables */
     RETURN_ERROR_IF(ZSTD_isError(ZSTD_loadDEntropy(
             &ddict->entropy, ddict->dictContent, ddict->dictSize)),

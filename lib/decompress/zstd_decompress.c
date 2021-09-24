@@ -218,7 +218,9 @@ size_t ZSTD_sizeof_DCtx (const ZSTD_DCtx* dctx)
 {
     if (dctx==NULL) return 0;   /* support sizeof NULL */
     return sizeof(*dctx)
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
            + ZSTD_sizeof_DDict(dctx->ddictLocal)
+#endif
            + dctx->inBuffSize + dctx->outBuffSize;
 }
 
@@ -240,17 +242,22 @@ static void ZSTD_DCtx_resetParameters(ZSTD_DCtx* dctx)
     dctx->maxWindowSize = ZSTD_MAXWINDOWSIZE_DEFAULT;
     dctx->outBufferMode = ZSTD_bm_buffered;
     dctx->forceIgnoreChecksum = ZSTD_d_validateChecksum;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     dctx->refMultipleDDicts = ZSTD_rmd_refSingleDDict;
+#endif
 }
 
 static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
 {
     dctx->staticSize  = 0;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     dctx->ddict       = NULL;
     dctx->ddictLocal  = NULL;
     dctx->dictEnd     = NULL;
     dctx->ddictIsCold = 0;
     dctx->dictUses = ZSTD_dont_use;
+    dctx->ddictSet = NULL;
+#endif
     dctx->inBuff      = NULL;
     dctx->inBuffSize  = 0;
     dctx->outBuffSize = 0;
@@ -264,7 +271,6 @@ static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
 #if DYNAMIC_BMI2
     dctx->bmi2 = ZSTD_cpuid_bmi2(ZSTD_cpuid());
 #endif
-    dctx->ddictSet = NULL;
     ZSTD_DCtx_resetParameters(dctx);
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     dctx->dictContentEndForFuzzing = NULL;
@@ -308,10 +314,12 @@ ZSTD_DCtx* ZSTD_createDCtx(void)
 
 static void ZSTD_clearDict(ZSTD_DCtx* dctx)
 {
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     ZSTD_freeDDict(dctx->ddictLocal);
     dctx->ddictLocal = NULL;
     dctx->ddict = NULL;
     dctx->dictUses = ZSTD_dont_use;
+#endif
 }
 
 size_t ZSTD_freeDCtx(ZSTD_DCtx* dctx)
@@ -319,17 +327,21 @@ size_t ZSTD_freeDCtx(ZSTD_DCtx* dctx)
     if (dctx==NULL) return 0;   /* support free on NULL */
     RETURN_ERROR_IF(dctx->staticSize, memory_allocation, "not compatible with static DCtx");
     {   ZSTD_customMem const cMem = dctx->customMem;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         ZSTD_clearDict(dctx);
+#endif
         ZSTD_customFree(dctx->inBuff, cMem);
         dctx->inBuff = NULL;
 #if defined(ZSTD_LEGACY_SUPPORT) && (ZSTD_LEGACY_SUPPORT >= 1)
         if (dctx->legacyContext)
             ZSTD_freeLegacyStreamContext(dctx->legacyContext, dctx->previousLegacyVersion);
 #endif
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         if (dctx->ddictSet) {
             ZSTD_freeDDictHashSet(dctx->ddictSet, cMem);
             dctx->ddictSet = NULL;
         }
+#endif
         ZSTD_customFree(dctx, cMem);
         return 0;
     }
@@ -350,6 +362,7 @@ void ZSTD_copyDCtx(ZSTD_DCtx* dstDCtx, const ZSTD_DCtx* srcDCtx)
  *
  * ZSTD_d_refMultipleDDicts must be enabled for this function to be called.
  */
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
 static void ZSTD_DCtx_selectFrameDDict(ZSTD_DCtx* dctx) {
     assert(dctx->refMultipleDDicts && dctx->ddictSet);
     DEBUGLOG(4, "Adjusting DDict based on requested dict ID from frame");
@@ -364,7 +377,7 @@ static void ZSTD_DCtx_selectFrameDDict(ZSTD_DCtx* dctx) {
         }
     }
 }
-
+#endif
 
 /*-*************************************************************
  *   Frame header decoding
@@ -668,21 +681,26 @@ unsigned long long ZSTD_getDecompressedSize(const void* src, size_t srcSize)
 static size_t ZSTD_decodeFrameHeader(ZSTD_DCtx* dctx, const void* src, size_t headerSize)
 {
     size_t const result = ZSTD_getFrameHeader_advanced(&(dctx->fParams), src, headerSize, dctx->format);
+    U32 dictID = 0;
     if (ZSTD_isError(result)) return result;    /* invalid header */
     RETURN_ERROR_IF(result>0, srcSize_wrong, "headerSize too small");
 
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     /* Reference DDict requested by frame if dctx references multiple ddicts */
     if (dctx->refMultipleDDicts == ZSTD_rmd_refMultipleDDicts && dctx->ddictSet) {
         ZSTD_DCtx_selectFrameDDict(dctx);
     }
+    dictID = dctx->dictID;
+#endif
 
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     /* Skip the dictID check in fuzzing mode, because it makes the search
      * harder.
      */
-    RETURN_ERROR_IF(dctx->fParams.dictID && (dctx->dictID != dctx->fParams.dictID),
+    RETURN_ERROR_IF(dctx->fParams.dictID && (dictID != dctx->fParams.dictID),
                     dictionary_wrong, "");
 #endif
+
     dctx->validateChecksum = (dctx->fParams.checksumFlag && !dctx->forceIgnoreChecksum) ? 1 : 0;
     if (dctx->validateChecksum) XXH64_reset(&dctx->xxhState, 0);
     dctx->processedCSize += headerSize;
@@ -848,11 +866,13 @@ static void ZSTD_DCtx_trace_end(ZSTD_DCtx const* dctx, U64 uncompressedSize, U64
         ZSTD_memset(&trace, 0, sizeof(trace));
         trace.version = ZSTD_VERSION_NUMBER;
         trace.streaming = streaming;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         if (dctx->ddict) {
             trace.dictionaryID = ZSTD_getDictID_fromDDict(dctx->ddict);
             trace.dictionarySize = ZSTD_DDict_dictSize(dctx->ddict);
             trace.dictionaryIsCold = dctx->ddictIsCold;
         }
+#endif
         trace.uncompressedSize = (size_t)uncompressedSize;
         trace.compressedSize = (size_t)compressedSize;
         trace.dctx = dctx;
@@ -1058,9 +1078,9 @@ size_t ZSTD_decompress_usingDict(ZSTD_DCtx* dctx,
     return ZSTD_decompressMultiFrame(dctx, dst, dstCapacity, src, srcSize, dict, dictSize, NULL);
 }
 
-
 static ZSTD_DDict const* ZSTD_getDDict(ZSTD_DCtx* dctx)
 {
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     switch (dctx->dictUses) {
     default:
         assert(0 /* Impossible */);
@@ -1074,6 +1094,9 @@ static ZSTD_DDict const* ZSTD_getDDict(ZSTD_DCtx* dctx)
         dctx->dictUses = ZSTD_dont_use;
         return dctx->ddict;
     }
+#else
+    return NULL;
+#endif
 }
 
 size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize)
@@ -1416,6 +1439,7 @@ ZSTD_loadDEntropy(ZSTD_entropyDTables_t* entropy,
     return (size_t)(dictPtr - (const BYTE*)dict);
 }
 
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
 static size_t ZSTD_decompress_insertDictionary(ZSTD_DCtx* dctx, const void* dict, size_t dictSize)
 {
     if (dictSize < 8) return ZSTD_refDictContent(dctx, dict, dictSize);
@@ -1436,6 +1460,7 @@ static size_t ZSTD_decompress_insertDictionary(ZSTD_DCtx* dctx, const void* dict
     /* reference dictionary content */
     return ZSTD_refDictContent(dctx, dict, dictSize);
 }
+#endif
 
 size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)
 {
@@ -1453,7 +1478,9 @@ size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)
     dctx->dictEnd = NULL;
     dctx->entropy.hufTable[0] = (HUF_DTable)((HufLog)*0x1000001);  /* cover both little and big endian */
     dctx->litEntropy = dctx->fseEntropy = 0;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     dctx->dictID = 0;
+#endif
     dctx->bType = bt_reserved;
     ZSTD_STATIC_ASSERT(sizeof(dctx->entropy.rep) == sizeof(repStartValue));
     ZSTD_memcpy(dctx->entropy.rep, repStartValue, sizeof(repStartValue));  /* initial repcodes */
@@ -1467,10 +1494,12 @@ size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)
 size_t ZSTD_decompressBegin_usingDict(ZSTD_DCtx* dctx, const void* dict, size_t dictSize)
 {
     FORWARD_IF_ERROR( ZSTD_decompressBegin(dctx) , "");
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     if (dict && dictSize)
         RETURN_ERROR_IF(
             ZSTD_isError(ZSTD_decompress_insertDictionary(dctx, dict, dictSize)),
             dictionary_corrupted, "");
+#endif
     return 0;
 }
 
@@ -1481,6 +1510,7 @@ size_t ZSTD_decompressBegin_usingDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
 {
     DEBUGLOG(4, "ZSTD_decompressBegin_usingDDict");
     assert(dctx != NULL);
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     if (ddict) {
         const char* const dictStart = (const char*)ZSTD_DDict_dictContent(ddict);
         size_t const dictSize = ZSTD_DDict_dictSize(ddict);
@@ -1489,10 +1519,13 @@ size_t ZSTD_decompressBegin_usingDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
         DEBUGLOG(4, "DDict is %s",
                     dctx->ddictIsCold ? "~cold~" : "hot!");
     }
+#endif
     FORWARD_IF_ERROR( ZSTD_decompressBegin(dctx) , "");
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
     if (ddict) {   /* NULL ddict is equivalent to no dictionary */
         ZSTD_copyDDictParameters(dctx, ddict);
     }
+#endif
     return 0;
 }
 
@@ -1575,6 +1608,7 @@ size_t ZSTD_freeDStream(ZSTD_DStream* zds)
 size_t ZSTD_DStreamInSize(void)  { return ZSTD_BLOCKSIZE_MAX + ZSTD_blockHeaderSize; }
 size_t ZSTD_DStreamOutSize(void) { return ZSTD_BLOCKSIZE_MAX; }
 
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
 size_t ZSTD_DCtx_loadDictionary_advanced(ZSTD_DCtx* dctx,
                                    const void* dict, size_t dictSize,
                                          ZSTD_dictLoadMethod_e dictLoadMethod,
@@ -1624,6 +1658,7 @@ size_t ZSTD_initDStream_usingDict(ZSTD_DStream* zds, const void* dict, size_t di
     FORWARD_IF_ERROR( ZSTD_DCtx_loadDictionary(zds, dict, dictSize) , "");
     return ZSTD_startingInputLength(zds->format);
 }
+#endif
 
 /* note : this variant can't fail */
 size_t ZSTD_initDStream(ZSTD_DStream* zds)
@@ -1651,7 +1686,7 @@ size_t ZSTD_resetDStream(ZSTD_DStream* dctx)
     return ZSTD_startingInputLength(dctx->format);
 }
 
-
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
 size_t ZSTD_DCtx_refDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
 {
     RETURN_ERROR_IF(dctx->streamStage != zdss_init, stage_wrong, "");
@@ -1672,6 +1707,7 @@ size_t ZSTD_DCtx_refDDict(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
     }
     return 0;
 }
+#endif
 
 /* ZSTD_DCtx_setMaxWindowSize() :
  * note : no direct equivalence in ZSTD_DCtx_setParameter,
@@ -1714,10 +1750,12 @@ ZSTD_bounds ZSTD_dParam_getBounds(ZSTD_dParameter dParam)
             bounds.lowerBound = (int)ZSTD_d_validateChecksum;
             bounds.upperBound = (int)ZSTD_d_ignoreChecksum;
             return bounds;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         case ZSTD_d_refMultipleDDicts:
             bounds.lowerBound = (int)ZSTD_rmd_refSingleDDict;
             bounds.upperBound = (int)ZSTD_rmd_refMultipleDDicts;
             return bounds;
+#endif
         default:;
     }
     bounds.error = ERROR(parameter_unsupported);
@@ -1755,9 +1793,11 @@ size_t ZSTD_DCtx_getParameter(ZSTD_DCtx* dctx, ZSTD_dParameter param, int* value
         case ZSTD_d_forceIgnoreChecksum:
             *value = (int)dctx->forceIgnoreChecksum;
             return 0;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         case ZSTD_d_refMultipleDDicts:
             *value = (int)dctx->refMultipleDDicts;
             return 0;
+#endif
         default:;
     }
     RETURN_ERROR(parameter_unsupported, "");
@@ -1784,6 +1824,7 @@ size_t ZSTD_DCtx_setParameter(ZSTD_DCtx* dctx, ZSTD_dParameter dParam, int value
             CHECK_DBOUNDS(ZSTD_d_forceIgnoreChecksum, value);
             dctx->forceIgnoreChecksum = (ZSTD_forceIgnoreChecksum_e)value;
             return 0;
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
         case ZSTD_d_refMultipleDDicts:
             CHECK_DBOUNDS(ZSTD_d_refMultipleDDicts, value);
             if (dctx->staticSize != 0) {
@@ -1791,6 +1832,7 @@ size_t ZSTD_DCtx_setParameter(ZSTD_DCtx* dctx, ZSTD_dParameter dParam, int value
             }
             dctx->refMultipleDDicts = (ZSTD_refMultipleDDicts_e)value;
             return 0;
+#endif
         default:;
     }
     RETURN_ERROR(parameter_unsupported, "");
@@ -1974,9 +2016,11 @@ size_t ZSTD_decompressStream(ZSTD_DStream* zds, ZSTD_outBuffer* output, ZSTD_inB
             }   }
 #endif
             {   size_t const hSize = ZSTD_getFrameHeader_advanced(&zds->fParams, zds->headerBuffer, zds->lhSize, zds->format);
+#if ZSTD_DECOMPRESS_DICTIONARY != 0
                 if (zds->refMultipleDDicts && zds->ddictSet) {
                     ZSTD_DCtx_selectFrameDDict(zds);
                 }
+#endif
                 DEBUGLOG(5, "header size : %u", (U32)hSize);
                 if (ZSTD_isError(hSize)) {
 #if defined(ZSTD_LEGACY_SUPPORT) && (ZSTD_LEGACY_SUPPORT>=1)
